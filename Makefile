@@ -1,7 +1,7 @@
 .PHONY: all build test run clean docker-build deploy
 
 PROJECT_ID ?= authenium-prod1
-REGION ?= asia-southeast2
+REGION ?= asia-southeast1
 SERVICE_NAME ?= vid-generator
 
 all: build test

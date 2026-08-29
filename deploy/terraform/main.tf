@@ -21,7 +21,7 @@ variable "project_id" {
 
 variable "region" {
   type        = string
-  default     = "asia-southeast2"
+  default     = "asia-southeast1"
   description = "GCP Region for Cloud Run and Firestore"
 }
 

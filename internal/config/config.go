@@ -46,7 +46,7 @@ func LoadFromEnv() *Config {
 
 	region := os.Getenv("REGION")
 	if region == "" {
-		region = "asia-southeast2"
+		region = "asia-southeast1"
 	}
 
 	thresholdStr := os.Getenv("STOCK_ALERT_THRESHOLD")
