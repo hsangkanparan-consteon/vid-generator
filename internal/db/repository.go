@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"cloud.google.com/go/firestore"
 	"google.golang.org/api/iterator"
+	firestorepb "google.golang.org/genproto/googleapis/firestore/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -221,29 +223,41 @@ func (r *Repository) GetStockStats(ctx context.Context, countryCode string) (*St
 
 	statuses := []VIDStatus{StatusAvailable, StatusAllocated, StatusInUse, StatusRevoked}
 	for _, st := range statuses {
-		aggQuery := r.client.Firestore.Collection(CollectionVIDs).
+		q := r.client.Firestore.Collection(CollectionVIDs).
 			Where("country", "==", countryCode).
-			Where("status", "==", st).
-			NewAggregationQuery().WithCount("count")
+			Where("status", "==", st)
 
+		aggQuery := q.NewAggregationQuery().WithCount("count")
 		results, err := aggQuery.Get(ctx)
 		if err == nil {
-			if countVal, ok := results["count"]; ok {
-				if cv, ok := countVal.(*firestore.IntegerValue); ok {
-					count := int(cv.Value)
-					switch st {
-					case StatusAvailable:
-						stats.Available = count
-					case StatusAllocated:
-						stats.Allocated = count
-					case StatusInUse:
-						stats.InUse = count
-					case StatusRevoked:
-						stats.Revoked = count
+			count := 0
+			if val, ok := results["count"]; ok {
+				switch v := val.(type) {
+				case int64:
+					count = int(v)
+				case int:
+					count = v
+				case *firestorepb.Value:
+					count = int(v.GetIntegerValue())
+				default:
+					str := fmt.Sprintf("%v", v)
+					if parsed, err := strconv.Atoi(str); err == nil {
+						count = parsed
 					}
-					stats.Total += count
 				}
 			}
+
+			switch st {
+			case StatusAvailable:
+				stats.Available = count
+			case StatusAllocated:
+				stats.Allocated = count
+			case StatusInUse:
+				stats.InUse = count
+			case StatusRevoked:
+				stats.Revoked = count
+			}
+			stats.Total += count
 		}
 	}
 
