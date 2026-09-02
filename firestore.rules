@@ -1,0 +1,11 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Public keys are public for offline mobile scanner synchronization
+    match /public_keys/{tenantId} {
+      allow read: if true;
+      allow write: if false; // Writes restricted to backend Cloud Run service account
+    }
+  }
+}

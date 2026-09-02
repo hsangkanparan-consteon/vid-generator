@@ -1,35 +1,32 @@
-# Build stage
-FROM golang:1.23-alpine AS builder
+# Multi-stage Dockerfile for Consteon QR Generator
+# Stage 1: Build binary
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
-# Install git and ca-certificates
-RUN apk add --no-cache git ca-certificates tzdata
+# Install ca-certificates and git
+RUN apk add --no-cache ca-certificates git
 
-# Cache Go dependencies
+# Cache dependencies
 COPY go.mod go.sum* ./
-RUN go mod download
+RUN go mod download || true
 
-# Copy source code
+# Copy source
 COPY . .
 
-# Build static binaries
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o /bin/server ./cmd/server
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o /bin/vid-cli ./cmd/cli
+# Build statically linked binary
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o /qr-server ./cmd/server
 
-# Final minimal production runtime
-FROM gcr.io/distroless/static-debian12:nonroot
+# Stage 2: Minimal runtime image
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates tzdata
 
 WORKDIR /
 
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
-COPY --from=builder /bin/server /bin/server
-COPY --from=builder /bin/vid-cli /bin/vid-cli
-
-USER nonroot:nonroot
+COPY --from=builder /qr-server /qr-server
 
 ENV PORT=8080
 EXPOSE 8080
 
-ENTRYPOINT ["/bin/server"]
+ENTRYPOINT ["/qr-server"]

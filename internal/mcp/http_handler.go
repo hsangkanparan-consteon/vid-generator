@@ -1,130 +1,60 @@
 package mcp
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-
-	"consteon.com/vid-generator/internal/middleware"
+	"sync"
 )
 
+// HTTPHandler exposes the MCP Server over HTTP (both direct JSON-RPC and SSE streams).
 type HTTPHandler struct {
-	server *Server
+	server   *Server
+	sessions sync.Map // sessionID -> chan JSONRPCResponse
 }
 
+// NewHTTPHandler creates an HTTPHandler for the MCP server.
 func NewHTTPHandler(s *Server) *HTTPHandler {
-	return &HTTPHandler{server: s}
-}
-
-func (h *HTTPHandler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/health", h.HandleHealth)
-	mux.HandleFunc("/mcp", h.HandleMCP)
-	mux.HandleFunc("/sse", h.HandleSSE)
-}
-
-func (h *HTTPHandler) HandleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "healthy",
-		"service": "vid-generator",
-		"version": "1.0.0",
-	})
-}
-
-func (h *HTTPHandler) extractActor(r *http.Request) middleware.ActorInfo {
-	identity := r.Header.Get("X-Goog-Authenticated-User-Email")
-	if identity == "" {
-		identity = r.Header.Get("X-Consumer-ID")
-	}
-	if identity == "" {
-		identity = "internal-service-account"
-	}
-
-	role := r.Header.Get("X-Authenium-Role")
-	if role == "" {
-		role = string(middleware.RoleAdmin)
-	}
-
-	ip := r.Header.Get("X-Forwarded-For")
-	if ip == "" {
-		ip = r.RemoteAddr
-	}
-
-	return middleware.ActorInfo{
-		Identity:  identity,
-		Role:      role,
-		IPAddress: ip,
-		UserAgent: r.UserAgent(),
+	return &HTTPHandler{
+		server: s,
 	}
 }
 
-func (h *HTTPHandler) HandleMCP(w http.ResponseWriter, r *http.Request) {
+// HandleMCPPost handles direct JSON-RPC 2.0 POST requests to /mcp.
+func (h *HTTPHandler) HandleMCPPost(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed (MCP requires POST)", http.StatusMethodNotAllowed)
+		http.Error(w, "Method Not Allowed (use POST)", http.StatusMethodNotAllowed)
 		return
 	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		h.writeError(w, nil, CodeParseError, "Failed to read request body")
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
 		return
 	}
 	defer r.Body.Close()
 
 	var req JSONRPCRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		h.writeError(w, nil, CodeParseError, "Invalid JSON format")
+		resp := JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &JSONRPCError{
+				Code:    ErrCodeParseError,
+				Message: "invalid JSON-RPC 2.0 payload: " + err.Error(),
+			},
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 
-	actor := h.extractActor(r)
-	ctx := r.Context()
-
-	switch req.Method {
-	case "initialize":
-		res := InitializeResult{
-			ProtocolVersion: "2024-11-05",
-			Capabilities: ServerCapabilities{
-				Tools: &ToolsCapability{ListChanged: true},
-			},
-			ServerInfo: Implementation{
-				Name:    "consteon-vid-generator",
-				Version: "1.0.0",
-			},
-			Instructions: "VID Generator MCP server for Authenium. Use generate_stock, allocate_vid, validate_vid, and get_stock_level.",
-		}
-		h.writeResult(w, req.ID, res)
-
-	case "tools/list":
-		tools := h.server.GetTools()
-		h.writeResult(w, req.ID, map[string]interface{}{
-			"tools": tools,
-		})
-
-	case "tools/call":
-		var callParams CallToolParams
-		if err := json.Unmarshal(req.Params, &callParams); err != nil {
-			h.writeError(w, req.ID, CodeInvalidParams, "Invalid tool call parameters")
-			return
-		}
-
-		result, err := h.server.CallTool(ctx, actor, callParams)
-		if err != nil {
-			h.writeError(w, req.ID, CodeInternalError, err.Error())
-			return
-		}
-		h.writeResult(w, req.ID, result)
-
-	case "ping":
-		h.writeResult(w, req.ID, map[string]string{"status": "pong"})
-
-	default:
-		h.writeError(w, req.ID, CodeMethodNotFound, fmt.Sprintf("Unknown method: %s", req.Method))
-	}
+	resp := h.server.HandleRPC(r.Context(), req)
+	writeJSON(w, http.StatusOK, resp)
 }
 
+// HandleSSE handles SSE connection on /sse or /mcp/sse.
 func (h *HTTPHandler) HandleSSE(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -132,36 +62,94 @@ func (h *HTTPHandler) HandleSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Generate unique session ID
+	sessionBytes := make([]byte, 16)
+	_, _ = rand.Read(sessionBytes)
+	sessionID := hex.EncodeToString(sessionBytes)
+
+	msgChan := make(chan JSONRPCResponse, 32)
+	h.sessions.Store(sessionID, msgChan)
+	defer func() {
+		h.sessions.Delete(sessionID)
+		close(msgChan)
+	}()
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	endpointURL := fmt.Sprintf("https://%s/mcp", r.Host)
+	// Send endpoint event with session ID
+	endpointURL := fmt.Sprintf("/mcp/messages?sessionId=%s", sessionID)
 	fmt.Fprintf(w, "event: endpoint\ndata: %s\n\n", endpointURL)
 	flusher.Flush()
 
-	<-r.Context().Done()
+	notify := r.Context().Done()
+	for {
+		select {
+		case <-notify:
+			return
+		case msg, ok := <-msgChan:
+			if !ok {
+				return
+			}
+			msgData, _ := json.Marshal(msg)
+			fmt.Fprintf(w, "event: message\ndata: %s\n\n", string(msgData))
+			flusher.Flush()
+		}
+	}
 }
 
-func (h *HTTPHandler) writeResult(w http.ResponseWriter, id interface{}, result interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	resp := JSONRPCResponse{
-		JSONRPC: "2.0",
-		ID:      id,
-		Result:  result,
+// HandleSSEMessage handles client messages posted to /mcp/messages?sessionId=...
+func (h *HTTPHandler) HandleSSEMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
 	}
-	json.NewEncoder(w).Encode(resp)
+
+	sessionID := r.URL.Query().Get("sessionId")
+	if sessionID == "" {
+		http.Error(w, "missing sessionId parameter", http.StatusBadRequest)
+		return
+	}
+
+	val, exists := h.sessions.Load(sessionID)
+	if !exists {
+		http.Error(w, "session not found or expired", http.StatusNotFound)
+		return
+	}
+	msgChan := val.(chan JSONRPCResponse)
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "failed to read body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	var req JSONRPCRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid JSON-RPC: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Process message in background and send response to SSE channel
+	go func() {
+		resp := h.server.HandleRPC(r.Context(), req)
+		if resp.ID != nil || resp.Error != nil {
+			select {
+			case msgChan <- resp:
+			default:
+			}
+		}
+	}()
+
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte(`{"status":"accepted"}`))
 }
 
-func (h *HTTPHandler) writeError(w http.ResponseWriter, id interface{}, code int, msg string) {
+func writeJSON(w http.ResponseWriter, statusCode int, data any) {
 	w.Header().Set("Content-Type", "application/json")
-	resp := JSONRPCResponse{
-		JSONRPC: "2.0",
-		ID:      id,
-		Error: &JSONRPCError{
-			Code:    code,
-			Message: msg,
-		},
-	}
-	json.NewEncoder(w).Encode(resp)
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(data)
 }
