@@ -1,6 +1,8 @@
 # Consteon Tenant Cryptographic Isolation & Log Encryption Specification
 
 **Version:** 1.0  
+**Date:** September 4, 2026  
+**Creator / Owner:** HH (Harry Huang)  
 **Status:** Approved / Active Standard  
 **Target Systems:** Mobile Apps, Field Scanners, Ingestion Microservices, Audit Log Processors, Decryption Services  
 
